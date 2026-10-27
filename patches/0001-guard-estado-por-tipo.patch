@@ -1,0 +1,112 @@
+diff --git a/apps/api/src/modules/issues/move.ts b/apps/api/src/modules/issues/move.ts
+index 61670a9..1e382ae 100644
+--- a/apps/api/src/modules/issues/move.ts
++++ b/apps/api/src/modules/issues/move.ts
+@@ -21,7 +21,7 @@ import { and, asc, eq, inArray, notInArray, or, sql } from 'drizzle-orm';
+ import { HttpError } from '#shared/lib';
+ import type { ProjectRow } from '#modules/projects/service';
+ import { assertWipLimit } from '#modules/columns/service';
+-import { getIssue, recordParentChange, type IssueRow } from './service';
++import { getIssue, recordParentChange, assertColumnForType, type IssueRow } from './service';
+ import { recordActivity, textSide } from './activity';
+ import { recordStatusChange } from './status-history';
+ import { recordCycleChange } from './cycle-history';
+@@ -112,6 +112,11 @@ export async function moveIssue(
+   const perColumn = new Map<number, number>();
+   for (const p of plans) perColumn.set(p.newColumnId, (perColumn.get(p.newColumnId) ?? 0) + 1);
+   for (const [id, incoming] of perColumn) await assertWipLimit(id, incoming);
++  // BUG-297 (MSF-338): an epic must not land on a history-only state in the target project
++  // either — checked before the transaction, so the move fails with a legible 400.
++  for (const p of plans) {
++    await assertColumnForType(target.id, p.newTypeId, p.newColumnId);
++  }
+ 
+   const labels = await mapLabels(movedIds, target.id);
+   const fields = await mapFields(movedIds, target.id);
+diff --git a/apps/api/src/modules/issues/service.ts b/apps/api/src/modules/issues/service.ts
+index 39ff205..1e520b5 100644
+--- a/apps/api/src/modules/issues/service.ts
++++ b/apps/api/src/modules/issues/service.ts
+@@ -784,6 +784,46 @@ async function assertColumn(projectId: number, columnId: number | undefined): Pr
+   if (rows.length === 0) throw new HttpError(400, 'Column must belong to this project');
+ }
+ 
++// BUG-297 (MSF-338): an EPIC must not land on a history-only state (En revision, En curso,
++// Merging, Listo...). This app does not validate column x type: `assertColumn` only checks that
++// the column belongs to the project, so an epic could be parked on a history state and would
++// leave the poller cycle — the poller only asks about epics in 'Implementation In Progress'
++// and the release stages, so nobody would promote it to 'Review In DEV' and it would wait
++// for a human. The mapping (project, issue type, column) lives in `guard_columna_prohibida`,
++// kept in sync by the operator; the Postgres trigger `trg_issue_columna_por_tipo` is the
++// final net. This check gives the legible 400.
++// Fail-safe: if the guard table is missing (a fresh install), nothing is blocked.
++export async function assertColumnForType(
++  projectId: number,
++  typeId: number | null | undefined,
++  columnId: number | undefined,
++): Promise<void> {
++  if (columnId === undefined || typeId == null) return;
++  let motivo: string | undefined;
++  try {
++    const rows = await db.execute(sql`
++      SELECT g.motivo AS motivo FROM guard_columna_prohibida g
++       WHERE g.project_id = ${projectId}
++         AND g.tipo_id = ${typeId}
++         AND g.project_column_id = ${columnId}
++    `);
++    motivo = (rows as { motivo?: string }[])[0]?.motivo ?? undefined;
++  } catch {
++    return; // no guard table (fresh install): never block the flow on it
++  }
++  if (!motivo) return;
++  throw new HttpError(
++    400,
++    `"${motivo}" is a HISTORY state and an epic does not use it: an epic on a history state leaves the ` +
++      `poller cycle — nobody promotes it to "Review In DEV" and it waits for a human. Epic states: ` +
++      `Backlog, Ready For Spec, Spec In Progress, Spec Review, Needs Info, Changes Requested, ` +
++      `Spec Approved, Implementation In Progress, Blocked, Review In DEV, Approved In Dev, Review In STG, ` +
++      `Approved In STG, Finalizada. If its stories are done and the closure is in review, the state is ` +
++      `"Implementation In Progress" (the poller promotes it to "Review In DEV" once the closure story ` +
++      `is Finalizada).`,
++  );
++}
++
+ // Enforces that an issue type belongs to the issue's project. Only checks when set
+ // to a non-null value (clearing the type is always allowed). Throws 400 otherwise.
+ async function assertIssueType(
+@@ -865,6 +905,7 @@ export async function createIssue(
+   await assertInitiative(project.id, input.initiativeId);
+   await assertCycle(project.id, input.cycleId);
+   await assertColumn(project.id, input.columnId);
++  await assertColumnForType(project.id, input.typeId, input.columnId);
+   await assertWipLimit(input.columnId);
+   await assertIssueType(project.id, input.typeId);
+   await assertParent(project.id, null, input.parentId);
+@@ -1044,6 +1085,11 @@ export async function updateIssue(
+   await assertInitiative(before.projectId, patch.initiativeId);
+   await assertCycle(before.projectId, patch.cycleId, before.cycleId);
+   await assertColumn(before.projectId, patch.columnId);
++  await assertColumnForType(
++    before.projectId,
++    patch.typeId !== undefined ? patch.typeId : before.typeId,
++    patch.columnId,
++  );
+   const movedToColumnId =
+     patch.columnId !== undefined && patch.columnId !== before.columnId ? patch.columnId : null;
+   // Only a move into a different column consumes capacity, so re-saving an issue
+@@ -1277,6 +1323,15 @@ export async function bulkUpdateIssues(
+   // the WIP message never names a column outside this project.
+   if (patch.columnId !== undefined) {
+     await assertColumn(projectId, patch.columnId);
++    // BUG-297: the whole batch is checked before any of it is written (a mid-batch failure
++    // would leave the move half-applied).
++    for (const id of valid) {
++      const row = await db
++        .select({ typeId: issue.typeId })
++        .from(issue)
++        .where(eq(issue.id, id));
++      await assertColumnForType(projectId, row[0]?.typeId, patch.columnId);
++    }
+     const incoming = await countEnteringColumn(valid, patch.columnId);
+     if (incoming > 0) await assertWipLimit(patch.columnId, incoming);
+   }

@@ -21,7 +21,7 @@ import { and, asc, eq, inArray, notInArray, or, sql } from 'drizzle-orm';
 import { HttpError } from '#shared/lib';
 import type { ProjectRow } from '#modules/projects/service';
 import { assertWipLimit } from '#modules/columns/service';
-import { getIssue, recordParentChange, type IssueRow } from './service';
+import { getIssue, recordParentChange, assertColumnForType, type IssueRow } from './service';
 import { recordActivity, textSide } from './activity';
 import { recordStatusChange } from './status-history';
 import { recordCycleChange } from './cycle-history';
@@ -112,6 +112,11 @@ export async function moveIssue(
   const perColumn = new Map<number, number>();
   for (const p of plans) perColumn.set(p.newColumnId, (perColumn.get(p.newColumnId) ?? 0) + 1);
   for (const [id, incoming] of perColumn) await assertWipLimit(id, incoming);
+  // BUG-297 (MSF-338): an epic must not land on a history-only state in the target project
+  // either — checked before the transaction, so the move fails with a legible 400.
+  for (const p of plans) {
+    await assertColumnForType(target.id, p.newTypeId, p.newColumnId);
+  }
 
   const labels = await mapLabels(movedIds, target.id);
   const fields = await mapFields(movedIds, target.id);
